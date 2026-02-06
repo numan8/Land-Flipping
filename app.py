@@ -6,13 +6,21 @@ import plotly.express as px
 # ----------------------------
 # Page config
 # ----------------------------
-st.set_page_config(
-    page_title="Cash Sales Velocity Dashboard",
-    layout="wide"
-)
+st.set_page_config(page_title="Cash Sales Velocity Dashboard", layout="wide")
 
 st.title("Cash Sales Velocity Dashboard")
-st.caption("Goal: Find pricing/markup sweet spots that maximize probability of selling in ≤30 or ≤60 days, and increase compounding cycles.")
+st.caption(
+    "Goal: Find pricing/markup sweet spots that maximize probability of selling in ≤30 or ≤60 days, "
+    "and increase compounding cycles."
+)
+
+# ----------------------------
+# Config knobs (client-safety)
+# ----------------------------
+MARKUP_CAP_DEFAULT = 10.0       # cap outliers (prevents 1495x)
+MIN_ROWS_FOR_BINS = 20          # require enough rows to show "Best bin"
+MIN_ROWS_FOR_CURVE = 40         # require enough rows for stable curve
+MIN_ROWS_SOFT_WARNING = 40      # show caution when sample is small
 
 # ----------------------------
 # Load data
@@ -36,7 +44,7 @@ def load_data(path: str) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Missing columns in dataset: {missing}")
 
-    # Type casting
+    # Types
     df["PURCHASE DATE"] = pd.to_datetime(df["PURCHASE DATE"], errors="coerce")
     df["SALE DATE - start"] = pd.to_datetime(df["SALE DATE - start"], errors="coerce")
 
@@ -48,11 +56,11 @@ def load_data(path: str) -> pd.DataFrame:
     df["profit_$"] = df["Cash Sales Price - amount"] - df["Total Purchase Price"]
     df["profit_pct_cost"] = np.where(df["Total Purchase Price"] > 0, df["profit_$"] / df["Total Purchase Price"], np.nan)
 
-    # Commissions assumptions
+    # Commission assumptions
     # - Acq Agent: 4% of PROFIT
     # - Sales Agent: 4% of PROFIT
     # - Affiliate/Listing Agent: 10% of SALE PRICE
-    df["commission_profit_based_$"] = 0.08 * df["profit_$"].clip(lower=0)  # only if profit positive
+    df["commission_profit_based_$"] = 0.08 * df["profit_$"].clip(lower=0)
     df["commission_sale_based_$"] = 0.10 * df["Cash Sales Price - amount"].clip(lower=0)
 
     df["net_profit_$"] = df["profit_$"] - df["commission_profit_based_$"] - df["commission_sale_based_$"]
@@ -102,11 +110,27 @@ selected_counties = st.sidebar.multiselect("County, State", county_options, defa
 city_options = sorted([c for c in df["Property Location or City"].dropna().unique()])
 selected_cities = st.sidebar.multiselect("City", city_options, default=[])
 
-dmin, dmax = int(df["days_to_sale"].min()), int(df["days_to_sale"].max())
-days_range = st.sidebar.slider("Days to sale range", min_value=dmin, max_value=dmax, value=(dmin, dmax))
+# days slider
+dmin = int(np.nanmin(df["days_to_sale"])) if df["days_to_sale"].notna().any() else 0
+dmax = int(np.nanmax(df["days_to_sale"])) if df["days_to_sale"].notna().any() else 365
+days_range = st.sidebar.slider("Days to sale range", min_value=dmin, max_value=dmax, value=(dmin, min(dmax, 365)))
 
-mm_min = float(np.nanmin(df["markup_multiple"]))
-mm_max = float(np.nanmax(df["markup_multiple"]))
+# markup slider with cap
+st.sidebar.subheader("Markup controls")
+markup_cap = st.sidebar.number_input(
+    "Markup cap (max multiple shown/used)",
+    min_value=1.0,
+    max_value=100.0,
+    value=float(MARKUP_CAP_DEFAULT),
+    step=0.5,
+    help="Caps extreme outliers so the dashboard stays realistic."
+)
+
+mm_min_raw = float(np.nanmin(df["markup_multiple"])) if df["markup_multiple"].notna().any() else 0.5
+mm_min = max(0.0, mm_min_raw)
+mm_max = min(float(np.nanmax(df["markup_multiple"])), float(markup_cap)) if df["markup_multiple"].notna().any() else float(markup_cap)
+mm_max = max(mm_max, mm_min + 0.01)
+
 markup_range = st.sidebar.slider(
     "Markup multiple range (Sale / Total Cost)",
     min_value=float(mm_min),
@@ -123,6 +147,7 @@ if selected_cities:
     f = f[f["Property Location or City"].isin(selected_cities)]
 f = f[(f["days_to_sale"] >= days_range[0]) & (f["days_to_sale"] <= days_range[1])]
 f = f[(f["markup_multiple"] >= markup_range[0]) & (f["markup_multiple"] <= markup_range[1])]
+f = f[f["markup_multiple"] <= float(markup_cap)]  # hard cap safety
 
 # ----------------------------
 # Helper: sweet-spot table
@@ -132,10 +157,12 @@ def sweet_spot_table(data: pd.DataFrame, target_days: int = 30, n_bins: int = 8)
     if len(d) < 10:
         return pd.DataFrame()
 
+    # If too few rows, reduce bins automatically
+    n_bins_eff = int(min(n_bins, max(3, len(d) // 10)))
     try:
-        d["mm_bin"] = pd.qcut(d["markup_multiple"], q=n_bins, duplicates="drop")
+        d["mm_bin"] = pd.qcut(d["markup_multiple"], q=n_bins_eff, duplicates="drop")
     except ValueError:
-        d["mm_bin"] = pd.cut(d["markup_multiple"], bins=n_bins)
+        d["mm_bin"] = pd.cut(d["markup_multiple"], bins=n_bins_eff)
 
     g = d.groupby("mm_bin", observed=True).agg(
         n=("markup_multiple", "size"),
@@ -149,16 +176,40 @@ def sweet_spot_table(data: pd.DataFrame, target_days: int = 30, n_bins: int = 8)
     g["mm_bin"] = g["mm_bin"].astype(str)
     g = g.sort_values("median_markup")
 
-    # Score: velocity-first
-    g["score"] = g["p_sell_within_target"] * 0.75 + g["median_net_profit_pct"].fillna(0) * 0.25
+    # Velocity-first score (probability gets more weight than margin)
+    g["score"] = g["p_sell_within_target"] * 0.80 + g["median_net_profit_pct"].fillna(0) * 0.20
 
-    # Display formatting
-    g["p_sell_within_target"] = (g["p_sell_within_target"] * 100).round(1)
-    g["median_net_profit_pct"] = (g["median_net_profit_pct"] * 100).round(1)
+    # Format for display (keep raw too)
+    g["p_sell_within_target_pct"] = (g["p_sell_within_target"] * 100).round(1)
+    g["median_net_profit_pct_disp"] = (g["median_net_profit_pct"] * 100).round(1)
     g["median_net_profit_dollars"] = g["median_net_profit_dollars"].round(0)
 
     return g
 
+
+def best_bin_message(t: pd.DataFrame, label: str, min_n: int) -> None:
+    if t.empty:
+        st.info("Not enough rows in current filter to compute bins.")
+        return
+
+    # Filter bins with enough support
+    t_ok = t[t["n"] >= max(3, min_n // 8)].copy()
+    if len(t_ok) == 0 or t["n"].sum() < min_n:
+        st.warning(
+            f"Not enough sample size to confidently declare a “best” {label} sweet spot. "
+            f"Try widening filters or aggregating to county/state. "
+            f"(Filtered deals: {int(t['n'].sum())})"
+        )
+        return
+
+    best = t_ok.sort_values(["score", "p_sell_within_target", "median_net_profit_pct"], ascending=False).head(1)
+
+    st.success(
+        f"Best {label} bin (min sample enforced): **{best['mm_bin'].iloc[0]}** | "
+        f"Median markup **{best['median_markup'].iloc[0]:.2f}x** | "
+        f"Sell{label} **{best['p_sell_within_target_pct'].iloc[0]:.1f}%** | "
+        f"Median net margin **{best['median_net_profit_pct_disp'].iloc[0]:.1f}%**"
+    )
 
 # ----------------------------
 # KPI row
@@ -171,8 +222,6 @@ pct_60 = (f["days_to_sale"] <= 60).mean() * 100 if n else 0
 
 median_days = float(np.nanmedian(f["days_to_sale"])) if n else np.nan
 median_mm = float(np.nanmedian(f["markup_multiple"])) if n else np.nan
-median_net = float(np.nanmedian(f["net_profit_pct_cost"])) * 100 if n else np.nan
-
 cycles_est = (365 / median_days) if (n and pd.notna(median_days) and median_days > 0) else np.nan
 
 col1.metric("Deals (filtered)", f"{n:,}")
@@ -181,6 +230,12 @@ col3.metric("Sell ≤60 days", f"{pct_60:.1f}%")
 col4.metric("Median days to sale", f"{median_days:.0f}" if pd.notna(median_days) else "—")
 col5.metric("Median markup multiple", f"{median_mm:.2f}" if pd.notna(median_mm) else "—")
 col6.metric("Est. cycles/year (median)", f"{cycles_est:.1f}" if pd.notna(cycles_est) else "—")
+
+if n and n < MIN_ROWS_SOFT_WARNING:
+    st.warning(
+        f"Small sample size in current filters (n={n}). Sweet spots/curves may be unstable. "
+        "For client decisions, prefer county/state or larger segments."
+    )
 
 st.divider()
 
@@ -200,52 +255,46 @@ with tab1:
     with left:
         st.markdown("### ≤30 days sweet spot")
         t30 = sweet_spot_table(f, target_days=30, n_bins=8)
-        if t30.empty:
-            st.info("Not enough rows in current filter to compute bins.")
-        else:
+        if not t30.empty:
             st.dataframe(
-                t30[["mm_bin", "n", "median_markup", "median_days", "p_sell_within_target",
-                     "median_net_profit_pct", "median_net_profit_dollars", "score"]],
+                t30[["mm_bin", "n", "median_markup", "median_days",
+                     "p_sell_within_target_pct", "median_net_profit_pct_disp",
+                     "median_net_profit_dollars", "score"]],
                 use_container_width=True
             )
-
-            best30 = t30.sort_values("score", ascending=False).head(1)
-            st.success(
-                f"Best (≤30d) bin: **{best30['mm_bin'].iloc[0]}** | "
-                f"Median markup **{best30['median_markup'].iloc[0]:.2f}x** | "
-                f"Sell≤30 **{best30['p_sell_within_target'].iloc[0]:.1f}%** | "
-                f"Median net margin **{best30['median_net_profit_pct'].iloc[0]:.1f}%**"
-            )
+        best_bin_message(t30, "≤30", MIN_ROWS_FOR_BINS)
 
     with right:
         st.markdown("### ≤60 days sweet spot")
         t60 = sweet_spot_table(f, target_days=60, n_bins=8)
-        if t60.empty:
-            st.info("Not enough rows in current filter to compute bins.")
-        else:
+        if not t60.empty:
             st.dataframe(
-                t60[["mm_bin", "n", "median_markup", "median_days", "p_sell_within_target",
-                     "median_net_profit_pct", "median_net_profit_dollars", "score"]],
+                t60[["mm_bin", "n", "median_markup", "median_days",
+                     "p_sell_within_target_pct", "median_net_profit_pct_disp",
+                     "median_net_profit_dollars", "score"]],
                 use_container_width=True
             )
-
-            best60 = t60.sort_values("score", ascending=False).head(1)
-            st.success(
-                f"Best (≤60d) bin: **{best60['mm_bin'].iloc[0]}** | "
-                f"Median markup **{best60['median_markup'].iloc[0]:.2f}x** | "
-                f"Sell≤60 **{best60['p_sell_within_target'].iloc[0]:.1f}%** | "
-                f"Median net margin **{best60['median_net_profit_pct'].iloc[0]:.1f}%**"
-            )
+        best_bin_message(t60, "≤60", MIN_ROWS_FOR_BINS)
 
     st.markdown("### Probability curve (Sell within X days vs markup multiple)")
+
     target_days = st.slider("Choose target days", 10, 120, 30, step=5)
 
     d = f.dropna(subset=["markup_multiple", "days_to_sale"]).copy()
-    if len(d) >= 10:
+    if len(d) < 10:
+        st.info("Not enough rows to plot probability curve.")
+    else:
+        if len(d) < MIN_ROWS_FOR_CURVE:
+            st.warning(
+                f"Curve stability warning: only {len(d)} rows in this segment. "
+                "Interpret the curve as directional; for client decisions use larger segments."
+            )
+
         d = d.sort_values("markup_multiple")
-        window = max(10, int(len(d) * 0.08))
+        # window size adapts; smaller samples -> smaller window
+        window = max(5, int(len(d) * 0.12))
         d["p_sell"] = (d["days_to_sale"] <= target_days).astype(int)
-        d["p_sell_smooth"] = d["p_sell"].rolling(window=window, min_periods=max(5, window // 3)).mean()
+        d["p_sell_smooth"] = d["p_sell"].rolling(window=window, min_periods=max(3, window // 2)).mean()
 
         fig = px.line(
             d,
@@ -255,11 +304,10 @@ with tab1:
                 "markup_multiple": "Markup multiple (Sale / Total Cost)",
                 "p_sell_smooth": f"Smoothed P(sell ≤ {target_days} days)"
             },
-            title=f"Probability of Fast Sale vs Markup (window={window})"
+            title=f"Probability of Fast Sale vs Markup (rolling window={window})"
         )
+        fig.update_yaxes(range=[0, 1])
         st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Not enough rows to plot probability curve.")
 
 # ----------------------------
 # Tab 2: Velocity & Pricing
@@ -346,7 +394,7 @@ with tab3:
             median_markup=("markup_multiple", "median"),
         ).reset_index()
 
-        g = g[g["n"] >= 3].sort_values("median_days")
+        g = g[g["n"] >= 5].sort_values("median_days")
 
         fig = px.bar(
             g.head(20),
@@ -354,7 +402,7 @@ with tab3:
             y="County, State",
             orientation="h",
             hover_data=["n", "pct_30", "pct_60", "median_markup"],
-            title="Top 20 Counties by Fastest Median Days (min 3 deals)"
+            title="Top 20 Counties by Fastest Median Days (min 5 deals)"
         )
         st.plotly_chart(fig, use_container_width=True)
 
@@ -385,7 +433,7 @@ with tab3:
         median_markup=("markup_multiple", "median"),
     ).reset_index()
 
-    city = city[city["n"] >= 3].sort_values("median_days")
+    city = city[city["n"] >= 5].sort_values("median_days")
     st.dataframe(city.head(30), use_container_width=True)
 
 # ----------------------------
@@ -408,7 +456,10 @@ with tab4:
         "SALE DATE - start",
     ]
 
-    st.dataframe(f[show_cols].sort_values("SALE DATE - start", ascending=False), use_container_width=True)
+    st.dataframe(
+        f[show_cols].sort_values("SALE DATE - start", ascending=False),
+        use_container_width=True
+    )
 
     csv = f[show_cols].to_csv(index=False).encode("utf-8")
     st.download_button(
@@ -418,4 +469,8 @@ with tab4:
         mime="text/csv"
     )
 
-st.caption("Note: This dashboard is descriptive. Prediction model can be added next (e.g., probability of selling ≤30/≤60 given markup, acres, county, etc.).")
+st.caption(
+    "Notes: (1) Markup multiples are capped to reduce outlier distortion. "
+    "(2) “Best bin” requires a minimum sample size to avoid misleading conclusions. "
+    "(3) This dashboard is descriptive; a predictive model can be added next."
+)
